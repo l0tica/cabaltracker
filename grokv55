@@ -1,0 +1,980 @@
+# -*- coding: utf-8 -*-
+# Cabal Online Dungeon Tracker V3.4 - Fixed Sales Delete and Backward Compatibility
+# Features: Fixed sales delete, Dungeon efficiency ranking, Added sale_id retrofitting
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import json
+import os
+import math
+from datetime import datetime, timedelta
+import re
+import time
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+try:
+    import openpyxl
+    OPENPYXL_AVAILABLE = True
+except ImportError:
+    OPENPYXL_AVAILABLE = False
+
+# --- Constants ---
+DATA_FILE = "cabal_tracker_data_v3.4.json"
+INITIAL_DUNGEONS = [
+    {"name": "CA5", "base_cost": 3500000, "cores": 0, "stones": 0},
+    {"name": "CA6", "base_cost": 4000000, "cores": 0, "stones": 0},
+    {"name": "CA7", "base_cost": 4500000, "cores": 0, "stones": 0},
+    {"name": "Lava ADX", "base_cost": 500000, "cores": 1, "stones": 0},
+    {"name": "Train ADX", "base_cost": 500000, "cores": 1, "stones": 0},
+    {"name": "Frozen ADX", "base_cost": 500000, "cores": 1, "stones": 0},
+    {"name": "Panic ADX", "base_cost": 500000, "cores": 1, "stones": 0},
+    {"name": "AT", "base_cost": 1000000, "cores": 0, "stones": 1},
+    {"name": "FN", "base_cost": 1000000, "cores": 0, "stones": 1},
+    {"name": "FC", "base_cost": 1000000, "cores": 0, "stones": 1},
+    {"name": "AHV", "base_cost": 1000000, "cores": 1, "stones": 0},
+    {"name": "AIC1", "base_cost": 2000000, "cores": 0, "stones": 1},
+    {"name": "AIC2", "base_cost": 2000000, "cores": 0, "stones": 1},
+    {"name": "AA", "base_cost": 2000000, "cores": 1, "stones": 0},
+    {"name": "EOP", "base_cost": 2000000, "cores": 0, "stones": 2},
+]
+K_PATTERN = re.compile(r"^\s*([\d.,]+)\s*k\s*$", re.IGNORECASE)
+KK_PATTERN = re.compile(r"^\s*([\d.,]+)\s*kk\s*$", re.IGNORECASE)
+NUMBER_PATTERN = re.compile(r"^\s*([\d.,]+)\s*$")
+DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# --- Utility Functions ---
+def parse_k_kk(value_str):
+    value_str = str(value_str).strip().replace(',', '')
+    if not value_str: return 0.0
+    kk_match = KK_PATTERN.match(value_str)
+    if kk_match:
+        try: return float(kk_match.group(1)) * 1_000_000
+        except ValueError: return None
+    k_match = K_PATTERN.match(value_str)
+    if k_match:
+        try: return float(k_match.group(1)) * 1_000
+        except ValueError: return None
+    num_match = NUMBER_PATTERN.match(value_str)
+    if num_match:
+        try: return float(num_match.group(1))
+        except ValueError: return None
+    return None
+
+def format_k_kk(value):
+    try:
+        value = float(value)
+        if not math.isfinite(value): return "Invalid"
+        if abs(value) >= 1_000_000:
+            num_str = f"{value / 1_000_000:.3f}".rstrip('0').rstrip('.')
+            return f"{num_str}kk"
+        elif abs(value) >= 1_000:
+            num_str = f"{value / 1_000:.3f}".rstrip('0').rstrip('.')
+            return f"{num_str}k"
+        else:
+            num_str = f"{value:.3f}".rstrip('0').rstrip('.')
+            return f"{int(value)}" if '.' not in num_str and value == int(value) else num_str
+    except (ValueError, TypeError):
+        return "Invalid"
+
+def format_duration(seconds):
+    if seconds is None or not isinstance(seconds, (int, float)) or seconds < 0 or not math.isfinite(seconds):
+        return "-"
+    try:
+        return str(timedelta(seconds=int(round(seconds))))
+    except OverflowError:
+        return "Overflow"
+
+def parse_date(date_str):
+    if not date_str or not DATE_PATTERN.match(date_str):
+        return None
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        return None
+
+def generate_unique_id(existing_ids):
+    ts_part = datetime.now().isoformat()
+    count = 0
+    unique_id = f"{ts_part}_{count}"
+    while unique_id in existing_ids:
+        count += 1
+        unique_id = f"{ts_part}_{count}"
+    return unique_id
+
+# --- Tooltip Class ---
+class Tooltip:
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.tip_window = None
+        self.widget.bind("<Enter>", self.show_tip)
+        self.widget.bind("<Leave>", self.hide_tip)
+
+    def show_tip(self, event=None):
+        if self.tip_window or not self.text:
+            return
+        x, y = self.widget.winfo_rootx() + 20, self.widget.winfo_rooty() + self.widget.winfo_height()
+        self.tip_window = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        label = ttk.Label(tw, text=self.text, background="#ffffe0", relief=tk.SOLID, borderwidth=1, padding=2)
+        label.pack()
+
+    def hide_tip(self, event=None):
+        if self.tip_window:
+            self.tip_window.destroy()
+            self.tip_window = None
+
+# --- Command Pattern for Undo/Redo ---
+class Command:
+    def execute(self): pass
+    def undo(self): pass
+
+class AddDropCommand(Command):
+    def __init__(self, app, drop):
+        self.app = app
+        self.drop = drop
+
+    def execute(self):
+        self.app.current_run_drops.append(self.drop)
+        self.app.update_drops_display()
+
+    def undo(self):
+        if self.drop in self.app.current_run_drops:
+            self.app.current_run_drops.remove(self.drop)
+            self.app.update_drops_display()
+
+# --- Data Management ---
+class DataManager:
+    def __init__(self, filename):
+        self.filename = filename
+        self.data = self.load_data()
+
+    def load_data(self):
+        default_data = {
+            "dungeons": sorted(INITIAL_DUNGEONS, key=lambda d: d.get('name', '')),
+            "run_history": [],
+            "item_values": {},
+            "predefined_drops": {},
+            "sales_history": []
+        }
+        if not os.path.exists(self.filename):
+            return default_data
+        try:
+            with open(self.filename, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                messagebox.showerror("Load Error", "Corrupted data file. Starting fresh.")
+                return default_data
+            for key, default_val in default_data.items():
+                if key not in data or not isinstance(data[key], type(default_val)):
+                    data[key] = default_val
+            data["dungeons"] = sorted(data["dungeons"], key=lambda d: d.get('name', ''))
+            # Retrofit sale_id to existing sales
+            used_ids = set()
+            for sale in data["sales_history"]:
+                if "sale_id" not in sale:
+                    new_id = generate_unique_id(used_ids)
+                    sale["sale_id"] = new_id
+                    used_ids.add(new_id)
+                else:
+                    used_ids.add(sale["sale_id"])
+            self.save_data(data)
+            return data
+        except Exception as e:
+            messagebox.showerror("Load Error", f"Error loading data: {e}\nStarting fresh.")
+            return default_data
+
+    def save_data(self, data):
+        temp_file = self.filename + ".tmp"
+        try:
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+            os.replace(temp_file, self.filename)
+        except Exception as e:
+            messagebox.showerror("Save Error", f"Could not save data: {e}")
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+
+# --- Main Application ---
+class CabalTrackerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Cabal Online - Dungeon Tracker V3.4")
+        self.root.geometry("1200x800")
+        self.data_manager = DataManager(DATA_FILE)
+        self.app_data = self.data_manager.data
+        self.dungeons_data = {d['name']: d for d in self.app_data["dungeons"]}
+        self.run_history = self.app_data["run_history"]
+        self.sales_history = self.app_data["sales_history"]
+        self.item_value_memory = self.app_data["item_values"]
+        self.predefined_drops = self.app_data["predefined_drops"]
+        self.run_id_map = {run['run_id']: run for run in self.run_history if 'run_id' in run}
+        self.sales_id_map = {sale['sale_id']: sale for sale in self.sales_history if 'sale_id' in sale}
+        self.filtered_run_history = list(self.run_history)
+
+        self.undo_stack = []
+        self.redo_stack = []
+
+        self.vars = {
+            "selected_dungeon": tk.StringVar(),
+            "num_runs": tk.StringVar(value="1"),
+            "core_cost": tk.StringVar(value="0"),
+            "stone_cost": tk.StringVar(value="0"),
+            "session_expense": tk.DoubleVar(value=0.0),
+            "session_total_value": tk.DoubleVar(value=0.0),
+            "item_name": tk.StringVar(),
+            "item_qty": tk.StringVar(value="1"),
+            "item_value": tk.StringVar(),
+            "filter_dungeon": tk.StringVar(value="All Dungeons"),
+            "filter_start_date": tk.StringVar(),
+            "filter_end_date": tk.StringVar(),
+            "timer_display": tk.StringVar(value="0:00:00"),
+            "sales_item": tk.StringVar(),
+            "sales_qty": tk.StringVar(value="1"),
+            "sales_price": tk.StringVar(),
+            "session_note": tk.StringVar()
+        }
+        self.selected_dungeon_details = None
+        self.current_run_drops = []
+        self.timer_running = False
+        self.timer_start_time = None
+        self.timer_elapsed_seconds = 0
+        self.timer_job = None
+
+        self.setup_ui()
+        self.apply_traces()
+        self.update_dropdowns()
+        self.apply_theme()
+
+    def apply_theme(self):
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("Accent.TButton", foreground="white", background="#0078D7", padding=5)
+        style.configure("Treeview.Heading", font=("Helvetica", 10, "bold"))
+        style.configure("Treeview", rowheight=25)
+
+    def setup_ui(self):
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(pady=10, padx=10, expand=True, fill="both")
+
+        self.tracker_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.tracker_tab, text="Run Tracker")
+        self.setup_tracker_tab()
+
+        self.manage_dungeons_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.manage_dungeons_tab, text="Manage Dungeons")
+        self.setup_manage_dungeons_tab()
+
+        self.manage_drops_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.manage_drops_tab, text="Manage Drops")
+        self.setup_manage_drops_tab()
+
+        self.sales_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.sales_tab, text="Sales Tracker")
+        self.setup_sales_tab()
+
+        self.analysis_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.analysis_tab, text="Analysis")
+        self.setup_analysis_tab()
+
+    def setup_tracker_tab(self):
+        pw = ttk.PanedWindow(self.tracker_tab, orient=tk.HORIZONTAL)
+        pw.pack(fill=tk.BOTH, expand=True)
+
+        left = ttk.Frame(pw, padding="10")
+        pw.add(left, weight=1)
+
+        dungeon_frame = ttk.LabelFrame(left, text="Dungeon & Expenses", padding="10")
+        dungeon_frame.pack(fill="x", pady=(0, 10))
+        ttk.Label(dungeon_frame, text="Dungeon:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        self.dungeon_combo = ttk.Combobox(dungeon_frame, textvariable=self.vars["selected_dungeon"], state="readonly")
+        self.dungeon_combo.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+        Tooltip(self.dungeon_combo, "Select the dungeon to track")
+        ttk.Button(dungeon_frame, text="+", width=3, command=lambda: self.notebook.select(self.manage_dungeons_tab)).grid(row=0, column=2, padx=5)
+        ttk.Label(dungeon_frame, text="Runs:").grid(row=1, column=0, padx=5, pady=5, sticky="e")
+        ttk.Entry(dungeon_frame, textvariable=self.vars["num_runs"], width=5, validate="key", validatecommand=(self.root.register(self.validate_int), "%P")).grid(row=1, column=1, padx=5, pady=5, sticky="w")
+        self.base_cost_label = ttk.Label(dungeon_frame, text="Cost / Run: -")
+        self.base_cost_label.grid(row=2, column=0, columnspan=3, padx=5, pady=2)
+        self.expense_frame = ttk.Frame(dungeon_frame)
+        self.expense_frame.grid(row=3, column=0, columnspan=3, padx=5, pady=5)
+        self.session_expense_label = ttk.Label(dungeon_frame, text="Total: 0", font=("Helvetica", 10, "bold"))
+        self.session_expense_label.grid(row=4, column=0, columnspan=3, padx=5, pady=5)
+
+        drop_frame = ttk.LabelFrame(left, text="Log Drops", padding="10")
+        drop_frame.pack(fill="x", pady=10)
+        ttk.Label(drop_frame, text="Item:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        self.item_combo = ttk.Combobox(drop_frame, textvariable=self.vars["item_name"])
+        self.item_combo.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+        Tooltip(self.item_combo, "Enter or select an item")
+        ttk.Button(drop_frame, text="+", width=3, command=lambda: self.notebook.select(self.manage_drops_tab)).grid(row=0, column=2, padx=5)
+        ttk.Label(drop_frame, text="Qty:").grid(row=1, column=0, padx=5, pady=5, sticky="e")
+        ttk.Entry(drop_frame, textvariable=self.vars["item_qty"], width=5, validate="key", validatecommand=(self.root.register(self.validate_int), "%P")).grid(row=1, column=1, padx=5, pady=5, sticky="w")
+        ttk.Label(drop_frame, text="Value (k/kk):").grid(row=2, column=0, padx=5, pady=5, sticky="e")
+        ttk.Entry(drop_frame, textvariable=self.vars["item_value"], width=12).grid(row=2, column=1, padx=5, pady=5, sticky="w")
+        ttk.Button(drop_frame, text="Add", command=self.add_drop, style="Accent.TButton").grid(row=3, column=0, columnspan=3, pady=5)
+        btn_frame = ttk.Frame(drop_frame)
+        btn_frame.grid(row=4, column=0, columnspan=3)
+        ttk.Button(btn_frame, text="Undo", command=self.undo).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Redo", command=self.redo).pack(side=tk.LEFT, padx=2)
+
+        drops_frame = ttk.LabelFrame(left, text="Session Drops", padding="10")
+        drops_frame.pack(fill="both", expand=True, pady=10)
+        self.drops_list = tk.Listbox(drops_frame, height=8, font=("Consolas", 10))
+        self.drops_list.pack(fill="both", expand=True)
+        btn_frame = ttk.Frame(drops_frame)
+        btn_frame.pack(fill="x", pady=5)
+        ttk.Button(btn_frame, text="Remove", command=self.remove_selected_drop).pack(side=tk.LEFT)
+        self.total_value_label = ttk.Label(btn_frame, text="Total: 0", font=("Helvetica", 10, "bold"))
+        self.total_value_label.pack(side=tk.RIGHT)
+
+        timer_frame = ttk.LabelFrame(left, text="Timer", padding="5")
+        timer_frame.pack(fill="x", pady=10)
+        ttk.Label(timer_frame, textvariable=self.vars["timer_display"], font=("Consolas", 14)).pack(side=tk.LEFT, padx=10)
+        self.timer_btn = ttk.Button(timer_frame, text="Start", command=self.toggle_timer)
+        self.timer_btn.pack(side=tk.LEFT, padx=5)
+        ttk.Button(timer_frame, text="Reset", command=self.stop_reset_timer).pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(left, text="Note:").pack(pady=5)
+        ttk.Entry(left, textvariable=self.vars["session_note"]).pack(fill="x")
+        Tooltip(left.winfo_children()[-1], "Add a note for this session")
+
+        ttk.Button(left, text="Save Session", command=self.finish_run, style="Accent.TButton").pack(pady=10)
+
+        right = ttk.Frame(pw, padding="10")
+        pw.add(right, weight=2)
+
+        filter_frame = ttk.LabelFrame(right, text="Filter History", padding="10")
+        filter_frame.pack(fill="x", pady=(0, 10))
+        ttk.Label(filter_frame, text="Dungeon:").grid(row=0, column=0, padx=5, sticky="e")
+        self.filter_combo = ttk.Combobox(filter_frame, textvariable=self.vars["filter_dungeon"], state="readonly")
+        self.filter_combo.grid(row=0, column=1, padx=5)
+        Tooltip(self.filter_combo, "Filter runs by dungeon")
+        ttk.Label(filter_frame, text="Start Date (YYYY-MM-DD):").grid(row=0, column=2, padx=5, sticky="e")
+        ttk.Entry(filter_frame, textvariable=self.vars["filter_start_date"], width=12).grid(row=0, column=3, padx=5)
+        ttk.Label(filter_frame, text="End Date (YYYY-MM-DD):").grid(row=1, column=2, padx=5, sticky="e")
+        ttk.Entry(filter_frame, textvariable=self.vars["filter_end_date"], width=12).grid(row=1, column=3, padx=5)
+        ttk.Button(filter_frame, text="Apply", command=self.apply_filters).grid(row=0, column=4, padx=5)
+        ttk.Button(filter_frame, text="Clear", command=self.clear_filters).grid(row=1, column=4, padx=5)
+
+        history_frame = ttk.LabelFrame(right, text="Run History", padding="10")
+        history_frame.pack(fill="both", expand=True, pady=10)
+        self.history_tree = ttk.Treeview(history_frame, columns=("date", "time", "dungeon", "runs", "duration", "profit", "efficiency", "note"), show="headings", height=12)
+        self.history_tree.pack(fill="both", expand=True)
+        for col, text, width in zip(self.history_tree["columns"], 
+                                   ["Date", "Time", "Dungeon", "Runs", "Duration", "Profit", "Alz/Hour", "Note"],
+                                   [100, 80, 120, 60, 100, 100, 100, 150]):
+            self.history_tree.heading(col, text=text)
+            self.history_tree.column(col, width=width, anchor="center", stretch=True)
+        self.history_tree.bind("<Button-3>", self.show_history_context_menu)
+        self.history_tree.bind("<Button-1>", self.resize_column_start)
+
+        stats_frame = ttk.LabelFrame(right, text="Statistics", padding="10")
+        stats_frame.pack(fill="both", expand=True, pady=10)
+        self.stats_text = tk.Text(stats_frame, height=8, state=tk.DISABLED, font=("Helvetica", 10))
+        self.stats_text.pack(fill="both", expand=True)
+
+        ttk.Button(right, text="Export History", command=self.export_history_to_excel, style="Accent.TButton").pack(pady=10)
+
+    def setup_manage_dungeons_tab(self):
+        frame = ttk.LabelFrame(self.manage_dungeons_tab, text="Manage Dungeons", padding="10")
+        frame.pack(fill="both", expand=True, pady=10)
+        self.dungeons_list = tk.Listbox(frame, height=15, font=("Consolas", 10))
+        self.dungeons_list.pack(side=tk.LEFT, fill="both", expand=True, padx=(0, 10))
+        self.dungeons_list.bind("<<ListboxSelect>>", self.on_dungeon_edit_select)
+        edit_frame = ttk.Frame(frame)
+        edit_frame.pack(side=tk.LEFT, fill="y")
+        ttk.Label(edit_frame, text="Name:").pack(pady=5)
+        self.dungeon_name_entry = ttk.Entry(edit_frame, width=20)
+        self.dungeon_name_entry.pack()
+        ttk.Label(edit_frame, text="Base Cost (k/kk):").pack(pady=5)
+        self.dungeon_cost_entry = ttk.Entry(edit_frame, width=10)
+        self.dungeon_cost_entry.pack()
+        ttk.Label(edit_frame, text="Cores:").pack(pady=5)
+        self.dungeon_cores_entry = ttk.Entry(edit_frame, width=5)
+        self.dungeon_cores_entry.pack()
+        ttk.Label(edit_frame, text="Stones:").pack(pady=5)
+        self.dungeon_stones_entry = ttk.Entry(edit_frame, width=5)
+        self.dungeon_stones_entry.pack()
+        ttk.Button(edit_frame, text="Save", command=self.save_dungeon, style="Accent.TButton").pack(pady=10)
+        ttk.Button(edit_frame, text="Delete", command=self.delete_dungeon).pack(pady=5)
+        self.update_dungeons_list()
+
+    def setup_manage_drops_tab(self):
+        frame = ttk.LabelFrame(self.manage_drops_tab, text="Manage Drops", padding="10")
+        frame.pack(fill="both", expand=True, pady=10)
+        self.drops_tree = ttk.Treeview(frame, columns=("name", "price"), show="headings", height=15)
+        self.drops_tree.pack(side=tk.LEFT, fill="both", expand=True, padx=(0, 10))
+        self.drops_tree.heading("name", text="Name")
+        self.drops_tree.heading("price", text="Current Price")
+        self.drops_tree.column("name", width=150, anchor="w")
+        self.drops_tree.column("price", width=100, anchor="center")
+        self.drops_tree.bind("<<TreeviewSelect>>", self.on_drop_edit_select)
+        edit_frame = ttk.Frame(frame)
+        edit_frame.pack(side=tk.LEFT, fill="y")
+        ttk.Label(edit_frame, text="Name:").pack(pady=5)
+        self.drop_name_entry = ttk.Entry(edit_frame, width=20)
+        self.drop_name_entry.pack()
+        ttk.Label(edit_frame, text="Default Price (k/kk):").pack(pady=5)
+        self.drop_price_entry = ttk.Entry(edit_frame, width=10)
+        self.drop_price_entry.pack()
+        ttk.Button(edit_frame, text="Save", command=self.save_drop, style="Accent.TButton").pack(pady=10)
+        ttk.Button(edit_frame, text="Delete", command=self.delete_drop).pack(pady=5)
+        self.update_drops_list()
+
+    def setup_sales_tab(self):
+        frame = ttk.LabelFrame(self.sales_tab, text="Sales Tracker", padding="10")
+        frame.pack(fill="both", expand=True, pady=10)
+
+        add_frame = ttk.Frame(frame)
+        add_frame.pack(fill="x", pady=(0, 10))
+        ttk.Label(add_frame, text="Item:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        ttk.Entry(add_frame, textvariable=self.vars["sales_item"]).grid(row=0, column=1, padx=5, pady=5)
+        Tooltip(add_frame.winfo_children()[1], "Enter the item sold")
+        ttk.Label(add_frame, text="Qty:").grid(row=1, column=0, padx=5, pady=5, sticky="e")
+        ttk.Entry(add_frame, textvariable=self.vars["sales_qty"], width=5, validate="key", validatecommand=(self.root.register(self.validate_int), "%P")).grid(row=1, column=1, padx=5, pady=5)
+        ttk.Label(add_frame, text="Price/Unit (k/kk):").grid(row=2, column=0, padx=5, pady=5, sticky="e")
+        ttk.Entry(add_frame, textvariable=self.vars["sales_price"]).grid(row=2, column=1, padx=5, pady=5)
+        ttk.Button(add_frame, text="Add Sale", command=self.add_sale, style="Accent.TButton").grid(row=3, column=0, columnspan=2, pady=5)
+
+        history_frame = ttk.LabelFrame(frame, text="Sales History", padding="10")
+        history_frame.pack(fill="both", expand=True)
+        self.sales_tree = ttk.Treeview(history_frame, columns=("date", "item", "qty", "price", "total"), show="headings", height=8)
+        self.sales_tree.pack(fill="both", expand=True)
+        for col, text, width in zip(self.sales_tree["columns"], ["Date", "Item", "Qty", "Price/Unit", "Total"], [120, 150, 60, 100, 100]):
+            self.sales_tree.heading(col, text=text)
+            self.sales_tree.column(col, width=width, anchor="center", stretch=True)
+        self.sales_tree.bind("<Button-3>", self.show_sales_context_menu)
+        self.sales_tree.bind("<Button-1>", self.resize_column_start)
+
+        stats_frame = ttk.LabelFrame(frame, text="Item Statistics", padding="10")
+        stats_frame.pack(fill="both", expand=True, pady=10)
+        self.sales_stats_tree = ttk.Treeview(stats_frame, columns=("item", "total_qty", "lowest", "highest", "average", "total_value"), show="headings", height=5)
+        self.sales_stats_tree.pack(fill="both", expand=True)
+        for col, text, width in zip(self.sales_stats_tree["columns"], 
+                                   ["Item", "Total Qty", "Lowest Price", "Highest Price", "Average Price", "Total Value"],
+                                   [150, 80, 100, 100, 100, 120]):
+            self.sales_stats_tree.heading(col, text=text)
+            self.sales_stats_tree.column(col, width=width, anchor="center", stretch=True)
+
+        export_frame = ttk.Frame(frame)
+        export_frame.pack(fill="x", pady=10)
+        ttk.Button(export_frame, text="Export Sales", command=self.export_sales_to_excel, style="Accent.TButton").pack(side=tk.RIGHT, padx=5)
+
+        self.update_sales_display()
+
+    def setup_analysis_tab(self):
+        frame = ttk.LabelFrame(self.analysis_tab, text="Analysis", padding="10")
+        frame.pack(fill="both", expand=True, pady=10)
+
+        graph_frame = ttk.LabelFrame(frame, text="Profit & Efficiency Graph", padding="10")
+        graph_frame.pack(fill="both", expand=True)
+        self.fig, self.ax = plt.subplots(figsize=(10, 4))
+        self.canvas = FigureCanvasTkAgg(self.fig, master=graph_frame)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        efficiency_frame = ttk.LabelFrame(frame, text="Dungeon Efficiency Ranking", padding="10")
+        efficiency_frame.pack(fill="both", expand=True, pady=10)
+        self.efficiency_tree = ttk.Treeview(efficiency_frame, columns=("dungeon", "runs", "profit", "duration", "efficiency"), show="headings", height=5)
+        self.efficiency_tree.pack(fill="both", expand=True)
+        for col, text, width in zip(self.efficiency_tree["columns"], 
+                                   ["Dungeon", "Runs", "Total Profit", "Total Duration", "Alz/Hour"],
+                                   [150, 60, 100, 100, 100]):
+            self.efficiency_tree.heading(col, text=text)
+            self.efficiency_tree.column(col, width=width, anchor="center", stretch=True)
+
+        ttk.Button(frame, text="Update Analysis", command=self.update_analysis, style="Accent.TButton").pack(pady=5)
+        self.update_analysis()
+
+    def apply_traces(self):
+        self.vars["selected_dungeon"].trace_add("write", self.on_dungeon_select)
+        self.vars["item_name"].trace_add("write", self.on_item_name_change)
+        self.vars["num_runs"].trace_add("write", self.calculate_session_expense)
+        self.vars["core_cost"].trace_add("write", self.calculate_session_expense)
+        self.vars["stone_cost"].trace_add("write", self.calculate_session_expense)
+
+    def update_dropdowns(self):
+        self.dungeon_combo["values"] = sorted(self.dungeons_data.keys())
+        self.item_combo["values"] = sorted(self.predefined_drops.keys())
+        self.filter_combo["values"] = ["All Dungeons"] + sorted(self.dungeons_data.keys())
+
+    def validate_int(self, value):
+        return value.isdigit() or value == ""
+
+    def on_dungeon_select(self, *args):
+        name = self.vars["selected_dungeon"].get()
+        self.selected_dungeon_details = self.dungeons_data.get(name)
+        for widget in self.expense_frame.winfo_children():
+            widget.destroy()
+        if self.selected_dungeon_details:
+            base_cost = self.selected_dungeon_details["base_cost"]
+            self.base_cost_label.config(text=f"Cost / Run: {format_k_kk(base_cost)}")
+            if self.selected_dungeon_details["cores"]:
+                ttk.Label(self.expense_frame, text=f"Cores ({self.selected_dungeon_details['cores']}x):").pack(side=tk.LEFT)
+                ttk.Entry(self.expense_frame, textvariable=self.vars["core_cost"], width=10).pack(side=tk.LEFT, padx=5)
+            if self.selected_dungeon_details["stones"]:
+                ttk.Label(self.expense_frame, text=f"Stones ({self.selected_dungeon_details['stones']}x):").pack(side=tk.LEFT)
+                ttk.Entry(self.expense_frame, textvariable=self.vars["stone_cost"], width=10).pack(side=tk.LEFT, padx=5)
+        self.calculate_session_expense()
+
+    def calculate_session_expense(self, *args):
+        num_runs = max(int(self.vars["num_runs"].get() or 1), 1)
+        expense = 0.0
+        if self.selected_dungeon_details:
+            expense += self.selected_dungeon_details["base_cost"]
+            expense += parse_k_kk(self.vars["core_cost"].get()) or 0
+            expense += parse_k_kk(self.vars["stone_cost"].get()) or 0
+        total = expense * num_runs
+        self.vars["session_expense"].set(total)
+        self.session_expense_label.config(text=f"Total: {format_k_kk(total)}")
+
+    def on_item_name_change(self, *args):
+        name = self.vars["item_name"].get().strip()
+        price = self.predefined_drops.get(name) or self.item_value_memory.get(name)
+        if price is not None:
+            self.vars["item_value"].set(format_k_kk(price))
+        else:
+            self.vars["item_value"].set("")
+
+    def add_drop(self):
+        name = self.vars["item_name"].get().strip()
+        qty = int(self.vars["item_qty"].get() or 1)
+        value = parse_k_kk(self.vars["item_value"].get()) or 0
+        if not name or qty <= 0 or value < 0:
+            messagebox.showwarning("Invalid Input", "Check item name, quantity, and value.")
+            return
+        self.item_value_memory[name] = value
+        drop = {"name": name, "qty": qty, "value_each": value, "total_value": qty * value}
+        command = AddDropCommand(self, drop)
+        command.execute()
+        self.undo_stack.append(command)
+        self.redo_stack.clear()
+        self.vars["item_qty"].set("1")
+        self.vars["item_value"].set("")
+
+    def undo(self):
+        if self.undo_stack:
+            command = self.undo_stack.pop()
+            command.undo()
+            self.redo_stack.append(command)
+
+    def redo(self):
+        if self.redo_stack:
+            command = self.redo_stack.pop()
+            command.execute()
+            self.undo_stack.append(command)
+
+    def update_drops_display(self):
+        self.drops_list.delete(0, tk.END)
+        total = sum(drop["total_value"] for drop in self.current_run_drops)
+        for drop in self.current_run_drops:
+            self.drops_list.insert(tk.END, f"{drop['qty']}x {drop['name']} @ {format_k_kk(drop['value_each'])} = {format_k_kk(drop['total_value'])}")
+        self.vars["session_total_value"].set(total)
+        self.total_value_label.config(text=f"Total: {format_k_kk(total)}")
+
+    def remove_selected_drop(self):
+        sel = self.drops_list.curselection()
+        if sel:
+            drop = self.current_run_drops.pop(sel[0])
+            self.update_drops_display()
+            self.undo_stack.append(AddDropCommand(self, drop))
+            self.redo_stack.clear()
+
+    def finish_run(self):
+        if not self.vars["selected_dungeon"].get():
+            messagebox.showwarning("No Dungeon", "Select a dungeon.")
+            return
+        num_runs = max(int(self.vars["num_runs"].get() or 1), 1)
+        duration = self.timer_elapsed_seconds + (time.time() - self.timer_start_time if self.timer_running else 0)
+        self.stop_reset_timer()
+        run_data = {
+            "run_id": generate_unique_id(self.run_id_map.keys()),
+            "timestamp": datetime.now().isoformat(),
+            "dungeon": self.vars["selected_dungeon"].get(),
+            "num_runs": num_runs,
+            "expenses": self.vars["session_expense"].get(),
+            "total_value": self.vars["session_total_value"].get(),
+            "profit": self.vars["session_total_value"].get() - self.vars["session_expense"].get(),
+            "duration_seconds": duration if duration > 0 else None,
+            "drops": self.current_run_drops[:],
+            "note": self.vars["session_note"].get()
+        }
+        self.run_history.append(run_data)
+        self.run_id_map[run_data["run_id"]] = run_data
+        self.data_manager.save_data(self.app_data)
+        self.apply_filters()
+        self.clear_session()
+        messagebox.showinfo("Saved", f"Session saved: {format_k_kk(run_data['profit'])} profit")
+
+    def clear_session(self):
+        self.current_run_drops.clear()
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.vars["item_name"].set("")
+        self.vars["item_qty"].set("1")
+        self.vars["item_value"].set("")
+        self.vars["core_cost"].set("0")
+        self.vars["stone_cost"].set("0")
+        self.vars["num_runs"].set("1")
+        self.vars["session_note"].set("")
+        self.update_drops_display()
+        self.stop_reset_timer()
+
+    def toggle_timer(self):
+        if self.timer_running:
+            self.timer_running = False
+            self.timer_elapsed_seconds += time.time() - self.timer_start_time
+            self.root.after_cancel(self.timer_job)
+            self.timer_btn.config(text="Resume")
+        else:
+            self.timer_running = True
+            self.timer_start_time = time.time()
+            self.timer_btn.config(text="Pause")
+            self.update_timer()
+
+    def update_timer(self):
+        if self.timer_running:
+            elapsed = time.time() - self.timer_start_time + self.timer_elapsed_seconds
+            self.vars["timer_display"].set(format_duration(elapsed))
+            self.timer_job = self.root.after(1000, self.update_timer)
+
+    def stop_reset_timer(self):
+        if self.timer_running:
+            self.timer_running = False
+            self.root.after_cancel(self.timer_job)
+        self.timer_elapsed_seconds = 0
+        self.timer_start_time = None
+        self.vars["timer_display"].set("0:00:00")
+        self.timer_btn.config(text="Start")
+
+    def apply_filters(self):
+        self.filtered_run_history = [run for run in self.run_history if self.matches_filter(run)]
+        self.update_history_and_stats()
+
+    def matches_filter(self, run):
+        dungeon = self.vars["filter_dungeon"].get()
+        start = parse_date(self.vars["filter_start_date"].get())
+        end = parse_date(self.vars["filter_end_date"].get())
+        if dungeon != "All Dungeons" and run.get("dungeon") != dungeon:
+            return False
+        ts = datetime.fromisoformat(run.get("timestamp", ""))
+        if start and ts < start:
+            return False
+        if end and ts > end.replace(hour=23, minute=59, second=59):
+            return False
+        return True
+
+    def clear_filters(self):
+        self.vars["filter_dungeon"].set("All Dungeons")
+        self.vars["filter_start_date"].set("")
+        self.vars["filter_end_date"].set("")
+        self.apply_filters()
+
+    def update_history_and_stats(self):
+        self.history_tree.delete(*self.history_tree.get_children())
+        total_profit = 0
+        total_runs = 0
+        total_duration = 0
+        dungeon_stats = {}
+        for run in self.filtered_run_history:
+            ts = datetime.fromisoformat(run["timestamp"])
+            profit = run["profit"]
+            duration = run["duration_seconds"] or 0
+            efficiency = (profit / (duration / 3600)) if duration > 0 else 0
+            total_profit += profit
+            total_runs += run["num_runs"]
+            total_duration += duration
+            dungeon = run["dungeon"]
+            if dungeon not in dungeon_stats:
+                dungeon_stats[dungeon] = {"profit": 0, "duration": 0, "runs": 0}
+            dungeon_stats[dungeon]["profit"] += profit
+            dungeon_stats[dungeon]["duration"] += duration
+            dungeon_stats[dungeon]["runs"] += run["num_runs"]
+            self.history_tree.insert("", tk.END, iid=run["run_id"], values=(
+                ts.strftime("%d/%m/%Y"), ts.strftime("%H:%M"), dungeon, run["num_runs"],
+                format_duration(duration), format_k_kk(profit), format_k_kk(efficiency), run.get("note", "")
+            ))
+        avg_efficiency = (total_profit / (total_duration / 3600)) if total_duration > 0 else 0
+        self.stats_text.config(state=tk.NORMAL)
+        self.stats_text.delete("1.0", tk.END)
+        self.stats_text.insert(tk.END, f"Total Runs: {total_runs}\n")
+        self.stats_text.insert(tk.END, f"Total Profit: {format_k_kk(total_profit)}\n")
+        self.stats_text.insert(tk.END, f"Total Duration: {format_duration(total_duration)}\n")
+        self.stats_text.insert(tk.END, f"Avg Alz/Hour: {format_k_kk(avg_efficiency)}\n\n")
+        self.stats_text.insert(tk.END, "Dungeon Efficiency:\n")
+        for dungeon, stats in dungeon_stats.items():
+            eff = (stats["profit"] / (stats["duration"] / 3600)) if stats["duration"] > 0 else 0
+            self.stats_text.insert(tk.END, f"{dungeon}: {format_k_kk(eff)} Alz/Hour ({stats['runs']} runs)\n")
+        self.stats_text.config(state=tk.DISABLED)
+        self.update_analysis()
+
+    def resize_column_start(self, event):
+        widget = event.widget
+        col = widget.identify_column(event.x)
+        if col:
+            col_id = col[1:]
+            x = event.x
+            orig_width = widget.column(f"#{col_id}", "width")
+            def resize_column_motion(e):
+                new_width = orig_width + (e.x - x)
+                widget.column(f"#{col_id}", width=max(50, new_width))
+            def resize_column_end(e):
+                widget.unbind("<B1-Motion>")
+                widget.unbind("<ButtonRelease-1>")
+            widget.bind("<B1-Motion>", resize_column_motion)
+            widget.bind("<ButtonRelease-1>", resize_column_end)
+
+    def show_history_context_menu(self, event):
+        sel = self.history_tree.identify_row(event.y)
+        if sel:
+            self.history_tree.selection_set(sel)
+            menu = tk.Menu(self.root, tearoff=0)
+            menu.add_command(label="Delete", command=lambda: self.delete_selected_history(sel))
+            menu.post(event.x_root, event.y_root)
+
+    def delete_selected_history(self, run_id):
+        if messagebox.askyesno("Confirm Delete", "Delete this run from history?"):
+            self.run_history = [run for run in self.run_history if run["run_id"] != run_id]
+            del self.run_id_map[run_id]
+            self.data_manager.save_data(self.app_data)
+            self.apply_filters()
+
+    def export_history_to_excel(self):
+        if not OPENPYXL_AVAILABLE:
+            messagebox.showerror("Error", "Install openpyxl for export.")
+            return
+        file = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")])
+        if file:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.append(["Date", "Dungeon", "Runs", "Profit", "Duration", "Alz/Hour", "Note"])
+            for run in self.filtered_run_history:
+                ts = datetime.fromisoformat(run["timestamp"])
+                duration = run["duration_seconds"] or 0
+                efficiency = (run["profit"] / (duration / 3600)) if duration > 0 else 0
+                ws.append([ts.strftime("%d/%m/%Y %H:%M"), run["dungeon"], run["num_runs"], run["profit"], format_duration(duration), efficiency, run.get("note", "")])
+            wb.save(file)
+            messagebox.showinfo("Exported", f"Saved to {file}")
+
+    def update_dungeons_list(self):
+        self.dungeons_list.delete(0, tk.END)
+        for name in sorted(self.dungeons_data.keys()):
+            self.dungeons_list.insert(tk.END, name)
+
+    def on_dungeon_edit_select(self, event):
+        sel = self.dungeons_list.curselection()
+        if sel:
+            name = self.dungeons_list.get(sel[0])
+            dungeon = self.dungeons_data[name]
+            self.dungeon_name_entry.delete(0, tk.END)
+            self.dungeon_name_entry.insert(0, name)
+            self.dungeon_cost_entry.delete(0, tk.END)
+            self.dungeon_cost_entry.insert(0, format_k_kk(dungeon["base_cost"]))
+            self.dungeon_cores_entry.delete(0, tk.END)
+            self.dungeon_cores_entry.insert(0, dungeon["cores"])
+            self.dungeon_stones_entry.delete(0, tk.END)
+            self.dungeon_stones_entry.insert(0, dungeon["stones"])
+
+    def save_dungeon(self):
+        name = self.dungeon_name_entry.get().strip()
+        cost = parse_k_kk(self.dungeon_cost_entry.get()) or 0
+        cores = int(self.dungeon_cores_entry.get() or 0)
+        stones = int(self.dungeon_stones_entry.get() or 0)
+        if not name or cost < 0 or cores < 0 or stones < 0:
+            messagebox.showwarning("Invalid Input", "Check dungeon details.")
+            return
+        if name in self.dungeons_data and name != self.dungeons_list.get(self.dungeons_list.curselection()[0] if self.dungeons_list.curselection() else ""):
+            messagebox.showerror("Error", "Dungeon name already exists.")
+            return
+        self.dungeons_data[name] = {"name": name, "base_cost": cost, "cores": cores, "stones": stones}
+        self.app_data["dungeons"] = list(self.dungeons_data.values())
+        self.data_manager.save_data(self.app_data)
+        self.update_dungeons_list()
+        self.update_dropdowns()
+
+    def delete_dungeon(self):
+        sel = self.dungeons_list.curselection()
+        if not sel:
+            messagebox.showwarning("No Selection", "Select a dungeon to delete.")
+            return
+        name = self.dungeons_list.get(sel[0])
+        if messagebox.askyesno("Confirm Delete", f"Delete '{name}' and its history?"):
+            del self.dungeons_data[name]
+            self.run_history = [run for run in self.run_history if run["dungeon"] != name]
+            self.run_id_map = {run["run_id"]: run for run in self.run_history}
+            self.app_data["dungeons"] = list(self.dungeons_data.values())
+            self.data_manager.save_data(self.app_data)
+            self.update_dungeons_list()
+            self.update_dropdowns()
+            self.apply_filters()
+
+    def update_drops_list(self):
+        self.drops_tree.delete(*self.drops_tree.get_children())
+        for name in sorted(self.predefined_drops.keys()):
+            price = self.predefined_drops[name]
+            self.drops_tree.insert("", tk.END, values=(name, format_k_kk(price)))
+
+    def on_drop_edit_select(self, event):
+        sel = self.drops_tree.selection()
+        if sel:
+            name, price = self.drops_tree.item(sel[0], "values")
+            self.drop_name_entry.delete(0, tk.END)
+            self.drop_name_entry.insert(0, name)
+            self.drop_price_entry.delete(0, tk.END)
+            self.drop_price_entry.insert(0, price)
+
+    def save_drop(self):
+        name = self.drop_name_entry.get().strip()
+        price = parse_k_kk(self.drop_price_entry.get()) or 0
+        if not name or price < 0:
+            messagebox.showwarning("Invalid Input", "Check drop details.")
+            return
+        self.predefined_drops[name] = price
+        self.app_data["predefined_drops"] = self.predefined_drops
+        self.data_manager.save_data(self.app_data)
+        self.update_drops_list()
+        self.update_dropdowns()
+
+    def delete_drop(self):
+        sel = self.drops_tree.selection()
+        if not sel:
+            messagebox.showwarning("No Selection", "Select a drop to delete.")
+            return
+        name = self.drops_tree.item(sel[0], "values")[0]
+        if messagebox.askyesno("Confirm Delete", f"Delete '{name}'?"):
+            del self.predefined_drops[name]
+            self.app_data["predefined_drops"] = self.predefined_drops
+            self.data_manager.save_data(self.app_data)
+            self.update_drops_list()
+            self.update_dropdowns()
+
+    def add_sale(self):
+        item = self.vars["sales_item"].get().strip()
+        qty = int(self.vars["sales_qty"].get() or 1)
+        price_per_unit = parse_k_kk(self.vars["sales_price"].get()) or 0
+        if not item or qty <= 0 or price_per_unit < 0:
+            messagebox.showwarning("Invalid Input", "Check sale details.")
+            return
+        sale = {
+            "sale_id": generate_unique_id(self.sales_id_map.keys()),
+            "timestamp": datetime.now().isoformat(),
+            "item": item,
+            "qty": qty,
+            "price_per_unit": price_per_unit,
+            "total": qty * price_per_unit
+        }
+        self.sales_history.append(sale)
+        self.sales_id_map[sale["sale_id"]] = sale
+        self.data_manager.save_data(self.app_data)
+        self.update_sales_display()
+        self.vars["sales_item"].set("")
+        self.vars["sales_qty"].set("1")
+        self.vars["sales_price"].set("")
+
+    def update_sales_display(self):
+        self.sales_tree.delete(*self.sales_tree.get_children())
+        for sale in sorted(self.sales_history, key=lambda x: x["timestamp"], reverse=True):
+            ts = datetime.fromisoformat(sale["timestamp"])
+            self.sales_tree.insert("", tk.END, iid=sale["sale_id"], values=(
+                ts.strftime("%d/%m/%Y %H:%M"), sale["item"], sale["qty"],
+                format_k_kk(sale["price_per_unit"]), format_k_kk(sale["total"])
+            ))
+
+        self.sales_stats_tree.delete(*self.sales_stats_tree.get_children())
+        item_stats = {}
+        for sale in self.sales_history:
+            item = sale["item"]
+            if item not in item_stats:
+                item_stats[item] = {"qty": 0, "total_value": 0, "prices": []}
+            item_stats[item]["qty"] += sale["qty"]
+            item_stats[item]["total_value"] += sale["total"]
+            item_stats[item]["prices"].append(sale["price_per_unit"])
+
+        for item, stats in sorted(item_stats.items()):
+            total_qty = stats["qty"]
+            total_value = stats["total_value"]
+            prices = stats["prices"]
+            lowest = min(prices)
+            highest = max(prices)
+            average = total_value / total_qty if total_qty > 0 else 0
+            self.sales_stats_tree.insert("", tk.END, values=(
+                item, total_qty, format_k_kk(lowest), format_k_kk(highest), format_k_kk(average), format_k_kk(total_value)
+            ))
+
+    def show_sales_context_menu(self, event):
+        sel = self.sales_tree.identify_row(event.y)
+        if sel:
+            self.sales_tree.selection_set(sel)
+            menu = tk.Menu(self.root, tearoff=0)
+            menu.add_command(label="Delete", command=lambda: self.delete_selected_sale(sel))
+            menu.post(event.x_root, event.y_root)
+
+    def delete_selected_sale(self, sale_id):
+        if messagebox.askyesno("Confirm Delete", "Delete this sale?"):
+            self.sales_history = [sale for sale in self.sales_history if sale["sale_id"] != sale_id]
+            del self.sales_id_map[sale_id]
+            self.data_manager.save_data(self.app_data)
+            self.update_sales_display()
+
+    def export_sales_to_excel(self):
+        if not OPENPYXL_AVAILABLE:
+            messagebox.showerror("Error", "Install openpyxl for export.")
+            return
+        file = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")])
+        if file:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.append(["Date", "Item", "Qty", "Price/Unit", "Total"])
+            for sale in self.sales_history:
+                ts = datetime.fromisoformat(sale["timestamp"])
+                ws.append([ts.strftime("%d/%m/%Y %H:%M"), sale["item"], sale["qty"], sale["price_per_unit"], sale["total"]])
+            wb.save(file)
+            messagebox.showinfo("Exported", f"Saved to {file}")
+
+    def update_analysis(self):
+        # Update Graph
+        self.ax.clear()
+        dates = [datetime.fromisoformat(run["timestamp"]) for run in self.filtered_run_history]
+        profits = [run["profit"] for run in self.filtered_run_history]
+        efficiencies = [(run["profit"] / (run["duration_seconds"] / 3600)) if run["duration_seconds"] else 0 for run in self.filtered_run_history]
+        self.ax.plot(dates, profits, label="Profit", color="blue")
+        self.ax.plot(dates, efficiencies, label="Alz/Hour", color="green")
+        self.ax.set_xlabel("Date")
+        self.ax.set_ylabel("Value")
+        self.ax.set_title("Profit and Efficiency Over Time")
+        self.ax.legend()
+        self.ax.tick_params(axis='x', rotation=45)
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+        # Update Efficiency Ranking
+        self.efficiency_tree.delete(*self.efficiency_tree.get_children())
+        dungeon_stats = {}
+        for run in self.filtered_run_history:
+            dungeon = run["dungeon"]
+            profit = run["profit"]
+            duration = run["duration_seconds"] or 0
+            if dungeon not in dungeon_stats:
+                dungeon_stats[dungeon] = {"profit": 0, "duration": 0, "runs": 0}
+            dungeon_stats[dungeon]["profit"] += profit
+            dungeon_stats[dungeon]["duration"] += duration
+            dungeon_stats[dungeon]["runs"] += run["num_runs"]
+
+        efficiency_list = [
+            (dungeon, stats["runs"], stats["profit"], stats["duration"], 
+             (stats["profit"] / (stats["duration"] / 3600)) if stats["duration"] > 0 else 0)
+            for dungeon, stats in dungeon_stats.items()
+        ]
+        efficiency_list.sort(key=lambda x: x[4], reverse=True)  # Sort by efficiency descending
+
+        for dungeon, runs, profit, duration, efficiency in efficiency_list:
+            self.efficiency_tree.insert("", tk.END, values=(
+                dungeon, runs, format_k_kk(profit), format_duration(duration), format_k_kk(efficiency)
+            ))
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = CabalTrackerApp(root)
+    root.protocol("WM_DELETE_WINDOW", lambda: (app.data_manager.save_data(app.app_data), root.destroy()))
+    root.mainloop()
